@@ -7,10 +7,15 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use deno_core::error::type_error;
 use deno_core::error::AnyError;
+use deno_core::futures;
+use deno_core::futures::FutureExt;
+use deno_core::task::spawn;
 use deno_core::task::spawn_blocking;
 use deno_core::AsyncRefCell;
 use deno_core::OpState;
@@ -18,6 +23,10 @@ use rusqlite::params;
 use rusqlite::OpenFlags;
 use rusqlite::OptionalExtension;
 use rusqlite::Transaction;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+use tokio::sync::OnceCell;
+use uuid::Uuid;
 
 use crate::AtomicWrite;
 use crate::CommitResult;
@@ -25,6 +34,7 @@ use crate::Database;
 use crate::DatabaseHandler;
 use crate::KvEntry;
 use crate::MutationKind;
+use crate::QueueMessageId;
 use crate::ReadRange;
 use crate::ReadRangeOutput;
 use crate::SnapshotReadOptions;
@@ -43,6 +53,18 @@ const STATEMENT_KV_POINT_GET_VERSION_ONLY: &str =
 const STATEMENT_KV_POINT_SET: &str =
   "insert into kv (k, v, v_encoding, version) values (:k, :v, :v_encoding, :version) on conflict(k) do update set v = :v, v_encoding = :v_encoding, version = :version";
 const STATEMENT_KV_POINT_DELETE: &str = "delete from kv where k = ?";
+
+const STATEMENT_QUEUE_ADD_READY: &str = "insert into queue (ts, id, data, backoff_schedule, keys_if_undelivered) values(?, ?, ?, ?, ?)";
+const STATEMENT_QUEUE_GET_NEXT_READY: &str = "select ts, id, data, backoff_schedule, keys_if_undelivered from queue where ts <= ? order by ts limit 100";
+const STATEMENT_QUEUE_GET_EARLIEST_READY: &str =
+  "select ts from queue order by ts limit 1";
+const STATEMENT_QUEUE_REMOVE_READY: &str = "delete from queue where id = ?";
+const STATEMENT_QUEUE_ADD_RUNNING: &str = "insert into queue_running (deadline, id, data, backoff_schedule, keys_if_undelivered) values(?, ?, ?, ?, ?)";
+const STATEMENT_QUEUE_REMOVE_RUNNING: &str =
+  "delete from queue_running where id = ?";
+const STATEMENT_QUEUE_GET_RUNNING_BY_ID: &str = "select deadline, id, data, backoff_schedule, keys_if_undelivered from queue_running where id = ?";
+const STATEMENT_QUEUE_GET_RUNNING: &str =
+  "select id from queue_running order by deadline limit 100";
 
 const STATEMENT_CREATE_MIGRATION_TABLE: &str = "
 create table if not exists migration_state(
@@ -182,14 +204,23 @@ impl<P: SqliteDbHandlerPermissions> DatabaseHandler for SqliteDbHandler<P> {
     .await
     .unwrap()?;
 
-    Ok(SqliteDb(Rc::new(AsyncRefCell::new(Cell::new(Some(conn))))))
+    Ok(SqliteDb {
+      conn: Rc::new(AsyncRefCell::new(Cell::new(Some(conn)))),
+      queue: OnceCell::new(),
+    })
   }
 }
 
-pub struct SqliteDb(Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>);
+pub struct SqliteDb {
+  conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>,
+  queue: OnceCell<SqliteQueue>,
+}
 
 impl SqliteDb {
-  async fn run_tx<F, R>(&self, f: F) -> Result<R, AnyError>
+  async fn run_tx<F, R>(
+    conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>,
+    f: F,
+  ) -> Result<R, AnyError>
   where
     F: (FnOnce(rusqlite::Transaction<'_>) -> Result<R, AnyError>)
       + Send
@@ -198,7 +229,7 @@ impl SqliteDb {
   {
     // Transactions need exclusive access to the connection. Wait until
     // we can borrow_mut the connection.
-    let cell = self.0.borrow_mut().await;
+    let cell = conn.borrow_mut().await;
 
     // Take the db out of the cell and run the transaction via spawn_blocking.
     let mut db = cell.take().unwrap();
@@ -220,6 +251,269 @@ impl SqliteDb {
   }
 }
 
+struct SqliteQueue {
+  conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>,
+  dequeue_rx: Rc<AsyncRefCell<mpsc::Receiver<(Vec<u8>, String)>>>,
+  shutdown_tx: watch::Sender<()>,
+  waker_tx: watch::Sender<()>,
+}
+
+impl SqliteQueue {
+  fn new(conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>) -> Self {
+    let conn_clone = conn.clone();
+    let (shutdown_tx, shutdown_rx) = watch::channel::<()>(());
+    let (waker_tx, waker_rx) = watch::channel::<()>(());
+    let (dequeue_tx, dequeue_rx) = mpsc::channel::<(Vec<u8>, String)>(64);
+
+    spawn(async move {
+      // Oneshot requeue of all inflight messages.
+      Self::requeue_inflight_messages(conn.clone()).await.unwrap();
+
+      // Continous dequeue loop.
+      Self::dequeue_loop(conn.clone(), dequeue_tx, shutdown_rx, waker_rx)
+        .await
+        .unwrap();
+    });
+
+    Self {
+      conn: conn_clone,
+      dequeue_rx: Rc::new(AsyncRefCell::new(dequeue_rx)),
+      shutdown_tx,
+      waker_tx,
+    }
+  }
+
+  async fn dequeue(&self) -> Result<(Vec<u8>, QueueMessageId), AnyError> {
+    let mut queue_rx = self.dequeue_rx.borrow_mut().await;
+
+    // @@@ concurrency limiter?
+    let Some((data, id)) = queue_rx.recv().await else {
+      return Err(type_error("Database closed"));
+    };
+
+    Ok((data, id))
+  }
+
+  async fn finish_msg(
+    &self,
+    msg_id: QueueMessageId,
+    success: bool,
+  ) -> Result<(), AnyError> {
+    SqliteDb::run_tx(self.conn.clone(), move |tx| {
+      if success {
+        let changed = tx
+          .prepare_cached(STATEMENT_QUEUE_REMOVE_RUNNING)?
+          .execute([&msg_id])?;
+        assert!(changed <= 1);
+      } else {
+        Self::requeue(&msg_id, &tx)?;
+      }
+      tx.commit()?;
+      Ok(())
+    })
+    .await
+  }
+
+  fn wake(&self) {
+    self.waker_tx.send(()).unwrap();
+  }
+
+  fn shutdown(&self) {
+    self.shutdown_tx.send(()).unwrap();
+  }
+
+  async fn dequeue_loop(
+    conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>,
+    dequeue_tx: mpsc::Sender<(Vec<u8>, String)>,
+    mut shutdown_rx: watch::Receiver<()>,
+    mut waker_rx: watch::Receiver<()>,
+  ) -> Result<(), AnyError> {
+    loop {
+      let messages = SqliteDb::run_tx(conn.clone(), move |tx| {
+        let now = SystemTime::now()
+          .duration_since(SystemTime::UNIX_EPOCH)
+          .unwrap()
+          .as_millis() as u64;
+
+        let messages = tx
+          .prepare_cached(STATEMENT_QUEUE_GET_NEXT_READY)?
+          .query_map([now], |row| {
+            let ts: u64 = row.get(0)?;
+            let id: String = row.get(1)?;
+            let data: Vec<u8> = row.get(2)?;
+            let backoff_schedule: String = row.get(3)?;
+            let keys_if_undelivered: String = row.get(4)?;
+            Ok((ts, id, data, backoff_schedule, keys_if_undelivered))
+          })?
+          .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+        for (ts, id, data, backoff_schedule, keys_if_undelivered) in &messages {
+          // Remove the message from the ready queue
+          let changed = tx
+            .prepare_cached(STATEMENT_QUEUE_REMOVE_READY)?
+            .execute(params![id])?;
+          assert_eq!(changed, 1);
+
+          let changed =
+            tx.prepare_cached(STATEMENT_QUEUE_ADD_RUNNING)?.execute(
+              params![ts, id, &data, &backoff_schedule, &keys_if_undelivered],
+            )?;
+          assert_eq!(changed, 1);
+        }
+        tx.commit()?;
+
+        let messages = messages
+          .into_iter()
+          .map(|(_, id, data, _, _)| (id, data))
+          .collect::<Vec<_>>();
+        Ok(messages)
+      })
+      .await;
+
+      let messages = match messages {
+        Ok(res) => res,
+        Err(err) => {
+          eprintln!("Error in dequeue loop: {}", err);
+          tokio::time::sleep(Duration::from_secs(1)).await;
+          continue;
+        }
+      };
+
+      let busy = !messages.is_empty();
+
+      for (id, data) in messages {
+        if dequeue_tx.send((data, id)).await.is_err() {
+          // Queue receiver was dropped. Stop the dequeue loop.
+          return Ok(());
+        }
+      }
+
+      if !busy {
+        // There's nothing to dequeue right now.
+        let sleep_fut = {
+          match Self::get_earliest_ready_ts(conn.clone()).await? {
+            Some(ts) => {
+              let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+              if ts > now {
+                tokio::time::sleep(Duration::from_millis(ts - now)).boxed()
+              } else {
+                futures::future::pending().boxed()
+              }
+            }
+            _ => futures::future::pending().boxed(),
+          }
+        };
+
+        tokio::select! {
+          _ = sleep_fut => {}
+          _ = waker_rx.changed() => {}
+          _ = shutdown_rx.changed() => return Ok(())
+        }
+      }
+    }
+  }
+
+  async fn get_earliest_ready_ts(
+    conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>,
+  ) -> Result<Option<u64>, AnyError> {
+    Ok(
+      SqliteDb::run_tx(conn.clone(), move |tx| {
+        let ts = tx
+          .prepare_cached(STATEMENT_QUEUE_GET_EARLIEST_READY)?
+          .query_row([], |row| {
+            let ts: u64 = row.get(0)?;
+            Ok(ts)
+          })
+          .optional()?;
+        Ok(ts)
+      })
+      .await?,
+    )
+  }
+
+  async fn requeue_inflight_messages(
+    conn: Rc<AsyncRefCell<Cell<Option<rusqlite::Connection>>>>,
+  ) -> Result<(), AnyError> {
+    loop {
+      let done = SqliteDb::run_tx(conn.clone(), move |tx| {
+        let entries = tx
+          .prepare_cached(STATEMENT_QUEUE_GET_RUNNING)?
+          .query_map([], |row| {
+            let id: String = row.get(0)?;
+            Ok(id)
+          })?
+          .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        for id in &entries {
+          Self::requeue(id, &tx)?
+        }
+        tx.commit()?;
+        Ok(entries.is_empty())
+      })
+      .await?;
+      if done {
+        return Ok(());
+      }
+    }
+  }
+
+  fn requeue(id: &str, tx: &rusqlite::Transaction<'_>) -> Result<(), AnyError> {
+    let Some((_deadline, id, data, backoff_schedule, keys_if_undelivered)) = tx
+    .prepare_cached(STATEMENT_QUEUE_GET_RUNNING_BY_ID)?
+    .query_row([id], |row| {
+      let deadline: u64 = row.get(0)?;
+      let id: String = row.get(1)?;
+      let data: Vec<u8> = row.get(2)?;
+      let backoff_schedule: String = row.get(3)?;
+      let keys_if_undelivered: String = row.get(4)?;
+      Ok((deadline, id, data, backoff_schedule, keys_if_undelivered))
+    })
+    .optional()? else {
+      return Ok(());
+    };
+
+    let backoff_schedule = {
+      let backoff_schedule =
+        serde_json::from_str::<Option<Vec<u64>>>(&backoff_schedule)?;
+      backoff_schedule.unwrap_or_default()
+    };
+
+    if !backoff_schedule.is_empty() {
+      // Requeue
+      let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+      let new_deadline = now + backoff_schedule[0];
+      let new_backoff_schedule = serde_json::to_string(&backoff_schedule[1..])?;
+      let changed = tx
+        .prepare_cached(STATEMENT_QUEUE_ADD_READY)?
+        .execute(params![
+          new_deadline,
+          id,
+          &data,
+          &new_backoff_schedule,
+          &keys_if_undelivered
+        ])
+        .unwrap();
+      assert_eq!(changed, 1);
+    } else {
+
+      // @@@TODO: dead letter queue
+    }
+
+    // Remove from inflight
+    let changed = tx
+      .prepare_cached(STATEMENT_QUEUE_REMOVE_RUNNING)?
+      .execute(params![id])?;
+    assert_eq!(changed, 1);
+
+    Ok(())
+  }
+}
+
 #[async_trait(?Send)]
 impl Database for SqliteDb {
   async fn snapshot_read(
@@ -227,52 +521,56 @@ impl Database for SqliteDb {
     requests: Vec<ReadRange>,
     _options: SnapshotReadOptions,
   ) -> Result<Vec<ReadRangeOutput>, AnyError> {
-    self
-      .run_tx(move |tx| {
-        let mut responses = Vec::with_capacity(requests.len());
-        for request in requests {
-          let mut stmt = tx.prepare_cached(if request.reverse {
-            STATEMENT_KV_RANGE_SCAN_REVERSE
-          } else {
-            STATEMENT_KV_RANGE_SCAN
-          })?;
-          let entries = stmt
-            .query_map(
-              (
-                request.start.as_slice(),
-                request.end.as_slice(),
-                request.limit.get(),
-              ),
-              |row| {
-                let key: Vec<u8> = row.get(0)?;
-                let value: Vec<u8> = row.get(1)?;
-                let encoding: i64 = row.get(2)?;
+    Self::run_tx(self.conn.clone(), move |tx| {
+      let mut responses = Vec::with_capacity(requests.len());
+      for request in requests {
+        let mut stmt = tx.prepare_cached(if request.reverse {
+          STATEMENT_KV_RANGE_SCAN_REVERSE
+        } else {
+          STATEMENT_KV_RANGE_SCAN
+        })?;
+        let entries = stmt
+          .query_map(
+            (
+              request.start.as_slice(),
+              request.end.as_slice(),
+              request.limit.get(),
+            ),
+            |row| {
+              let key: Vec<u8> = row.get(0)?;
+              let value: Vec<u8> = row.get(1)?;
+              let encoding: i64 = row.get(2)?;
 
-                let value = decode_value(value, encoding);
+              let value = decode_value(value, encoding);
 
-                let version: i64 = row.get(3)?;
-                Ok(KvEntry {
-                  key,
-                  value,
-                  versionstamp: version_to_versionstamp(version),
-                })
-              },
-            )?
-            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
-          responses.push(ReadRangeOutput { entries });
-        }
+              let version: i64 = row.get(3)?;
+              Ok(KvEntry {
+                key,
+                value,
+                versionstamp: version_to_versionstamp(version),
+              })
+            },
+          )?
+          .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+        responses.push(ReadRangeOutput { entries });
+      }
 
-        Ok(responses)
-      })
-      .await
+      Ok(responses)
+    })
+    .await
   }
 
   async fn atomic_write(
     &self,
     write: AtomicWrite,
   ) -> Result<Option<CommitResult>, AnyError> {
-    self
-      .run_tx(move |tx| {
+    let (has_enqueues, commit_result) =
+      Self::run_tx(self.conn.clone(), move |tx| {
+        let now = SystemTime::now()
+          .duration_since(SystemTime::UNIX_EPOCH)
+          .unwrap()
+          .as_millis() as u64;
+
         for check in write.checks {
           let real_versionstamp = tx
             .prepare_cached(STATEMENT_KV_POINT_GET_VERSION_ONLY)?
@@ -280,7 +578,7 @@ impl Database for SqliteDb {
             .optional()?
             .map(version_to_versionstamp);
           if real_versionstamp != check.versionstamp {
-            return Ok(None);
+            return Ok((false, None));
           }
         }
 
@@ -336,17 +634,83 @@ impl Database for SqliteDb {
           }
         }
 
-        // TODO(@losfair): enqueues
+        let has_enqueues = !write.enqueues.is_empty();
+        for enqueue in write.enqueues {
+          let id = Uuid::new_v4().to_string();
+          let backoff_schedule = serde_json::to_string(
+            &enqueue
+              .backoff_schedule
+              .or_else(|| Some(vec![1000, 5000, 60000, 120000, 300000])),
+          )?;
+          let keys_if_undelivered =
+            serde_json::to_string(&enqueue.keys_if_undelivered)?;
+
+          let changed =
+            tx.prepare_cached(STATEMENT_QUEUE_ADD_READY)?
+              .execute(params![
+                now + enqueue.delay_ms,
+                id,
+                &enqueue.payload,
+                &backoff_schedule,
+                &keys_if_undelivered
+              ])?;
+          assert_eq!(changed, 1)
+        }
 
         tx.commit()?;
-
         let new_vesionstamp = version_to_versionstamp(version);
 
-        Ok(Some(CommitResult {
-          versionstamp: new_vesionstamp,
-        }))
+        Ok((
+          has_enqueues,
+          Some(CommitResult {
+            versionstamp: new_vesionstamp,
+          }),
+        ))
       })
-      .await
+      .await?;
+
+    if has_enqueues {
+      if let Some(queue) = self.queue.get() {
+        queue.wake();
+      }
+    }
+    Ok(commit_result)
+  }
+
+  // @@@ This method needs to async-block if there is nothing to dequeue
+  /*
+  - When the method starts
+  - Spin up a task, which will:
+     - create 2 futures:
+        - one future will keep polling the active queue, and will push messages into tx channel
+            - the channel will be providing back pressure
+            - maybe this back pressure could be the concurrency limiter?
+        - the other future will keep checking the inflight queue, and will requeue or kill
+        - the futures should not be done, unless we're shutting down
+  */
+  async fn dequeue_next_message(
+    &self,
+  ) -> Result<(Vec<u8>, QueueMessageId), AnyError> {
+    let queue = self
+      .queue
+      .get_or_init(|| async move { SqliteQueue::new(self.conn.clone()) })
+      .await;
+    queue.dequeue().await
+  }
+
+  async fn finish_dequeued_message(
+    &self,
+    msg_id: QueueMessageId,
+    success: bool,
+  ) -> Result<(), AnyError> {
+    let queue = self.queue.get().unwrap();
+    queue.finish_msg(msg_id, success).await
+  }
+
+  fn close(&self) {
+    if let Some(queue) = self.queue.get() {
+      queue.shutdown();
+    }
   }
 }
 

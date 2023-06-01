@@ -1915,6 +1915,13 @@ declare namespace Deno {
      */
     delete(key: KvKey): this;
     /**
+     * ...
+     */
+    enqueue(
+      message: unknown,
+      options?: { delay?: 0, keys_if_undelivered?: Deno.KvKey[] },
+    ): this;
+    /**
      * Commit the operation to the KV store. Returns a value indicating whether
      * checks passed and mutations were performed. If the operation failed
      * because of a failed check, the return value will be a {@linkcode
@@ -2086,6 +2093,29 @@ declare namespace Deno {
       selector: KvListSelector,
       options?: KvListOptions,
     ): KvListIterator<T>;
+
+    /**
+     * @@@ Enqueue...
+     * @param message
+     * @param options
+     * @returns
+     * @see
+     */
+    enqueue(
+      message: unknown,
+      options?: { delay?: 0, keys_if_undelivered?: Deno.KvKey[] },
+    ): Promise<void>;
+
+    /**
+     * @@@ Listen...
+     * @param handler
+     *  
+     * @see
+     * @returns
+     */ 
+    queue_listen(
+      handler: (message: unknown) => Promise<void> | void
+    ): Promise<void>;
 
     /**
      * Create a new {@linkcode Deno.AtomicOperation} object which can be used to

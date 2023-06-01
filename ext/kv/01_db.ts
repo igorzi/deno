@@ -19,7 +19,7 @@ const encodeCursor: (
   selector: [Deno.KvKey | null, Deno.KvKey | null, Deno.KvKey | null],
   boundaryKey: Deno.KvKey,
 ) => string = (selector, boundaryKey) =>
-  ops.op_kv_encode_cursor(selector, boundaryKey);
+    ops.op_kv_encode_cursor(selector, boundaryKey);
 
 async function openKv(path: string) {
   const rid = await core.opAsync("op_kv_database_open", path);
@@ -47,6 +47,7 @@ const kvSymbol = Symbol("KvRid");
 
 class Kv {
   #rid: number;
+  #closed: boolean;
 
   constructor(rid: number = undefined, symbol: symbol = undefined) {
     if (kvSymbol !== symbol) {
@@ -55,6 +56,7 @@ class Kv {
       );
     }
     this.#rid = rid;
+    this.#closed = false;
   }
 
   atomic() {
@@ -203,8 +205,86 @@ class Kv {
     };
   }
 
+  async enqueue(message: unknown, opts?: { delay?: 0, keys_if_undelivered?: Deno.KvKey[] }) {
+    const checks = [];
+    const mutations = [];
+    const enqueues = [
+      [core.serialize(message, { forStorage: true }), opts?.delay ?? 0, opts?.keys_if_undelivered ?? [], null]
+    ];
+    
+    const versionstamp = await core.opAsync(
+      "op_kv_atomic_write",
+      this.#rid,
+      checks,
+      mutations,
+      enqueues,
+    );
+    if (versionstamp === null) throw new TypeError("Failed to set value");
+  }
+
+  /*
+   - Keep looping and calling op_kv_queue_next_message + op_kv_queue_ack_message
+   - What happens if the user callback fails?
+     - Should we just let the backend timeout catch this?
+     - Or should we eagerly tell the backend that it failed?
+     - I'm thinking that we should tell the backend
+        - Because if we want to allow long-running tasks, then how could we differentiate?
+        - If we know that the callback fails, we should tell the queue right away
+     - JS it-self should not do any retries, etc.. it should just be dumb
+     - The queue backend should drive all of that
+   - JS should not do the timeout detection either.
+   - Since it's all running in the same process, we can just assume no message loss
+   - When a task is running, the queue backend can just assume that it's running
+   - If it fails in JS, JS will tell us
+   - If it doesn't fail, we assume that it's still running
+   - BUT!!!
+      - When listen is called the first time, we have to process all pending messages first.
+   - ALSO BUT!
+      - We should keep in-memory list of running unacked messages
+      - This is equivalent to liveness check
+      - This way, when we check the running queue.. we ignore the messages that are in this memory table
+
+====================
+Should there be a bg task for timeouts? Or should everything just be done inside op_kv_queue_next_message?
+- I think lets do all the work inside op_kv_queue_next_message and op_kv_queue_ack_message
+   */
+
+  async queue_listen(handler: (message: unknown) => Promise<void> | void): Promise<void> {
+    while (!this.#closed) {
+      let next: { 0: Uint8Array, 1: number };
+      try {
+        next = await core.opAsync(
+          "op_kv_queue_next_message",
+          this.#rid,
+        );
+      } catch (error) {
+        if (this.#closed) {
+          break;
+        } else {
+          throw error;
+        }
+      }
+
+      const { 0: msg, 1: msgId } = next;
+      const message = core.deserialize(msg, { forStorage: true });
+
+      (async () => {
+        let success = false;
+        try {
+          const dispatched = handler(message);
+          const res = dispatched instanceof Promise ? (await dispatched) : dispatched;
+          success = true;
+        } catch (error) {
+          console.error("Exception in queue handler", error);
+        }
+        await core.opAsync("op_kv_queue_finish_message", this.#rid, msgId, success);
+      })();
+    }
+  }
+
   close() {
     core.close(this.#rid);
+    this.#closed = true;
   }
 }
 
@@ -213,6 +293,7 @@ class AtomicOperation {
 
   #checks: [Deno.KvKey, string | null][] = [];
   #mutations: [Deno.KvKey, string, RawValue | null][] = [];
+  #enqueues: [Uint8Array, number, [Deno.KvKey], [number] | null][] = [];
 
   constructor(rid: number) {
     this.#rid = rid;
@@ -280,13 +361,19 @@ class AtomicOperation {
     return this;
   }
 
+  // @@@ add tests
+  enqueue(message: unknown, opts?: { delay?: 0, keys_if_undelivered?: Deno.KvKey[] }): this {
+    this.#enqueues.push([core.serialize(message, { forStorage: true }), opts?.delay ?? 0, opts?.keys_if_undelivered ?? [], null]);
+    return this;
+  }
+
   async commit(): Promise<Deno.KvCommitResult | Deno.KvCommitError> {
     const versionstamp = await core.opAsync(
       "op_kv_atomic_write",
       this.#rid,
       this.#checks,
       this.#mutations,
-      [], // TODO(@losfair): enqueue
+      this.#enqueues,
     );
     if (versionstamp === null) return { ok: false };
     return { ok: true, versionstamp };

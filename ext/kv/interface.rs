@@ -35,6 +35,18 @@ pub trait Database {
     &self,
     write: AtomicWrite,
   ) -> Result<Option<CommitResult>, AnyError>;
+
+  async fn dequeue_next_message(
+    &self,
+  ) -> Result<(Vec<u8>, QueueMessageId), AnyError>;
+
+  async fn finish_dequeued_message(
+    &self,
+    msg_id: QueueMessageId,
+    success: bool,
+  ) -> Result<(), AnyError>;
+
+  fn close(&self);
 }
 
 /// Options for a snapshot read.
@@ -242,7 +254,7 @@ pub struct KvMutation {
 /// keys specified in `keys_if_undelivered`.
 pub struct Enqueue {
   pub payload: Vec<u8>,
-  pub deadline_ms: u64,
+  pub delay_ms: u64,
   pub keys_if_undelivered: Vec<Vec<u8>>,
   pub backoff_schedule: Option<Vec<u32>>,
 }
@@ -313,3 +325,5 @@ pub struct CommitResult {
   /// The new versionstamp of the data that was committed.
   pub versionstamp: Versionstamp,
 }
+
+pub type QueueMessageId = String;
