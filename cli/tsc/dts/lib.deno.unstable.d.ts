@@ -1319,6 +1319,26 @@ declare namespace Deno {
 
   /** **UNSTABLE**: New API, yet to be vetted.
    *
+   * Create a cron job that will periodically execute the provided handler
+   * callback based on the specified schedule.
+   *
+   * ```ts
+   * Deno.cron("sample cron", "*\/20 * * * *", () => {
+   *   console.log("cron job executed");
+   * });
+   * ```
+   *
+   * @category Cron
+   */
+  export function cron(
+    name: string,
+    schedule: string,
+    handler: () => Promise<void> | void,
+    options?: { backoffSchedule?: number[]; signal?: AbortSignal },
+  ): Promise<void>;
+
+  /** **UNSTABLE**: New API, yet to be vetted.
+   *
    * A key to be persisted in a {@linkcode Deno.Kv}. A key is a sequence
    * of {@linkcode Deno.KvKeyPart}s.
    *
