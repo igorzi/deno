@@ -32,6 +32,8 @@ use deno_terminal::colors;
 
 use std::env;
 use std::env::current_exe;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crate::args::Flags;
 
@@ -68,11 +70,34 @@ fn unwrap_or_exit<T>(result: Result<T, AnyError>) -> T {
 }
 
 fn main() {
+  eprintln!(
+    "{:?}: main",
+    SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .unwrap()
+      .as_millis()
+  );
   let args: Vec<String> = env::args().collect();
   let future = async move {
     let current_exe_path = current_exe().unwrap();
+    eprintln!(
+      "{:?}: before extract_standalone",
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+    );
     match standalone::extract_standalone(&current_exe_path, args).await {
-      Ok(Some((metadata, eszip))) => standalone::run(eszip, metadata).await,
+      Ok(Some((metadata, eszip))) => {
+        eprintln!(
+          "{:?}: after extract_standalone",
+          SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+        );
+        standalone::run(eszip, metadata).await
+      }
       Ok(None) => Err(generic_error("No archive found.")),
       Err(err) => Err(err),
     }
