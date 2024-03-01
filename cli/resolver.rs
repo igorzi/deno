@@ -47,6 +47,7 @@ use crate::npm::CliNpmResolver;
 use crate::npm::InnerCliNpmResolverRef;
 use crate::util::path::specifier_to_file_path;
 use crate::util::sync::AtomicFlag;
+use crate::util::time::utc_now;
 
 pub fn format_range_with_colors(range: &deno_graph::Range) -> String {
   format!(
@@ -217,6 +218,10 @@ impl NpmModuleLoader {
     maybe_referrer: Option<&ModuleSpecifier>,
     permissions: &PermissionsContainer,
   ) -> Result<ModuleCodeStringSource, AnyError> {
+    eprintln!(
+      "{:?}: npm_modul_loader.load_sync",
+      utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    );
     let file_path = specifier.to_file_path().unwrap();
     let code = self
       .fs
@@ -488,6 +493,10 @@ impl Resolver for CliGraphResolver {
     referrer_range: &deno_graph::Range,
     mode: ResolutionMode,
   ) -> Result<ModuleSpecifier, ResolveError> {
+    eprintln!(
+      "{:?}: graph_resolver.resolve",
+      utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    );
     fn to_node_mode(mode: ResolutionMode) -> NodeResolutionMode {
       match mode {
         ResolutionMode::Execution => NodeResolutionMode::Execution,
@@ -755,6 +764,10 @@ impl NpmResolver for CliGraphResolver {
     &self,
     package_name: &str,
   ) -> LocalBoxFuture<'static, Result<(), AnyError>> {
+    eprintln!(
+      "{:?}: graph_resolver.load_and_cache_npm_package_info",
+      utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    );
     match &self.npm_resolver {
       Some(npm_resolver) if npm_resolver.as_managed().is_some() => {
         let package_name = package_name.to_string();
@@ -775,6 +788,10 @@ impl NpmResolver for CliGraphResolver {
   }
 
   fn resolve_npm(&self, package_req: &PackageReq) -> NpmPackageReqResolution {
+    eprintln!(
+      "{:?}: graph_resolver.resolve_npm",
+      utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+    );
     match &self.npm_resolver {
       Some(npm_resolver) => match npm_resolver.as_inner() {
         InnerCliNpmResolverRef::Managed(npm_resolver) => {

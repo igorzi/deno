@@ -24,6 +24,7 @@ use crate::resolver::MappedSpecifierResolver;
 use crate::resolver::NpmModuleLoader;
 use crate::util::progress_bar::ProgressBar;
 use crate::util::progress_bar::ProgressBarStyle;
+use crate::util::time::utc_now;
 use crate::util::v8::construct_v8_flags;
 use crate::worker::CliMainWorkerFactory;
 use crate::worker::CliMainWorkerOptions;
@@ -304,6 +305,10 @@ pub async fn run(
   mut eszip: eszip::EszipV2,
   metadata: Metadata,
 ) -> Result<(), AnyError> {
+  eprintln!(
+    "{:?}: run",
+    utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+  );
   let main_module = &metadata.entrypoint;
   let current_exe_path = std::env::current_exe().unwrap();
   let current_exe_name =
@@ -335,6 +340,10 @@ pub async fn run(
       }) => {
         // this will always have a snapshot
         let snapshot = eszip.take_npm_snapshot().unwrap();
+        eprintln!(
+          "{:?}: managed. after take_npm_snapshot",
+          utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+        );
         let vfs_root_dir_path = if node_modules_dir {
           root_path
         } else {
@@ -342,6 +351,10 @@ pub async fn run(
         };
         let vfs = load_npm_vfs(vfs_root_dir_path.clone())
           .context("Failed to load npm vfs.")?;
+        eprintln!(
+          "{:?}: after load_npm_vfs",
+          utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+        );
         let maybe_node_modules_path = if node_modules_dir {
           Some(vfs.root().to_path_buf())
         } else {
@@ -380,6 +393,10 @@ pub async fn run(
         )
       }
       Some(binary::NodeModules::Byonm { package_json_deps }) => {
+        eprintln!(
+          "{:?}: byonm",
+          utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+        );
         let vfs_root_dir_path = root_path;
         let vfs = load_npm_vfs(vfs_root_dir_path.clone())
           .context("Failed to load npm vfs.")?;
@@ -406,6 +423,10 @@ pub async fn run(
         )
       }
       None => {
+        eprintln!(
+          "{:?}: none",
+          utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+        );
         let package_json_deps_provider =
           Arc::new(PackageJsonDepsProvider::new(None));
         let fs = Arc::new(deno_fs::RealFs) as Arc<dyn deno_fs::FileSystem>;
@@ -563,6 +584,10 @@ pub async fn run(
     .create_main_worker(main_module.clone(), permissions)
     .await?;
 
+  eprintln!(
+    "{:?}: before worker.run",
+    utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+  );
   let exit_code = worker.run().await?;
   std::process::exit(exit_code)
 }

@@ -36,6 +36,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use crate::args::Flags;
+use crate::util::time::utc_now;
 
 pub(crate) fn unstable_exit_cb(feature: &str, api_name: &str) {
   eprintln!(
@@ -72,29 +73,20 @@ fn unwrap_or_exit<T>(result: Result<T, AnyError>) -> T {
 fn main() {
   eprintln!(
     "{:?}: main",
-    SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .unwrap()
-      .as_millis()
+    utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
   );
   let args: Vec<String> = env::args().collect();
   let future = async move {
     let current_exe_path = current_exe().unwrap();
     eprintln!(
       "{:?}: before extract_standalone",
-      SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
+      utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
     );
     match standalone::extract_standalone(&current_exe_path, args).await {
       Ok(Some((metadata, eszip))) => {
         eprintln!(
           "{:?}: after extract_standalone",
-          SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
+          utc_now().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
         );
         standalone::run(eszip, metadata).await
       }
